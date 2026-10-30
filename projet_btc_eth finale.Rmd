@@ -1,0 +1,515 @@
+---
+title: "Mini-projet Séries Temporelles — Bitcoin et Ethereum "
+author: "Maryem jbeli syrine bejaoui Yosri karchoud saif sbaiti"
+date: "Octobre 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+    keep_md: true
+---
+
+
+Ce document reproduit en **R** le socle classique du projet (sections 1, 2, 3 et 6 du sujet), sur les mêmes données, la même période et le même découpage que le notebook Python `projet_btc_eth.ipynb`. Les réseaux de neurones (section 4), l'approche hybride et l'extension (section 7) sont implémentés **en Python uniquement**.
+
+Les explications théoriques détaillées figurent dans le notebook Python et dans le rapport. Ici, chaque bloc rappelle ce qu'il fait, pourquoi, et comment lire son résultat.
+
+```{r configuration, message=FALSE, warning=FALSE}
+# Installe les packages.
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+paquets <- c("quantmod", "xts", "zoo", "forecast", "tseries", "urca", "vars", "FinTS", "rugarch", "knitr")
+absents <- setdiff(paquets, rownames(installed.packages()))
+if (length(absents) > 0) install.packages(absents)
+invisible(lapply(paquets, library, character.only = TRUE))
+
+# Fixe les paramètres globaux à un seul endroit.
+set.seed(42)
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 10, fig.height = 4, fig.path = "resultats_R/figures/", dev = "png")
+DEBUT <- "2018-01-01"; FIN <- "2026-09-30"
+PART_TRAIN <- 0.90; H <- 10; HORIZONS <- c(1, 5, 10); ALPHA <- 0.05
+dir.create("resultats_R/tables", recursive = TRUE, showWarnings = FALSE)
+
+# Enregistre chaque tableau en CSV et l'affiche : le rapport s'appuie sur ces fichiers.
+tableau <- function(x, nom, chiffres = 4) {
+  write.csv(x, file.path("resultats_R/tables", paste0(nom, ".csv")))
+  knitr::kable(x, digits = chiffres)
+}
+# Traduit une p-value en phrase : évite de se tromper sur le sens d'un test.
+verdict <- function(p, h0) {
+  if (p < ALPHA) sprintf("p = %.4f < %.2f : on rejette H0 (%s)", p, ALPHA, h0)
+  else sprintf("p = %.4f >= %.2f : on ne rejette pas H0 (%s)", p, ALPHA, h0)
+}
+```
+
+```{r versions}
+# Affiche les versions.
+data.frame(version = sapply(paquets, function(p) as.character(packageVersion(p))), row.names = paquets) |> knitr::kable()
+R.version.string
+```
+
+# 1. Importation et préparation des données
+
+**Source :** Yahoo Finance via `quantmod`. **Période :** `r DEBUT` au `r FIN`. **Fréquence :** journalière, 7 jours sur 7. **Transformations du fournisseur :** aucune (pas de dividende pour une cryptomonnaie), ce que le bloc vérifie.
+
+```{r donnees}
+# Télécharge une fois puis relit la copie locale.
+cache <- "donnees_brutes_R.rds"
+if (file.exists(cache)) {
+  brut <- readRDS(cache)
+} else {
+  btc <- getSymbols("BTC-USD", src = "yahoo", from = DEBUT, to = as.character(as.Date(FIN) + 2), auto.assign = FALSE)
+  eth <- getSymbols("ETH-USD", src = "yahoo", from = DEBUT, to = as.character(as.Date(FIN) + 2), auto.assign = FALSE)
+  brut <- merge(Cl(btc), Ad(btc), Vo(btc), Cl(eth), Ad(eth), Vo(eth))
+  colnames(brut) <- c("BTC_Close", "BTC_Adj", "BTC_Volume", "ETH_Close", "ETH_Adj", "ETH_Volume")
+  saveRDS(brut, cache)
+}
+brut <- brut[paste0(DEBUT, "/", FIN)]
+
+# Aligne sur un calendrier journalier complet : un jour absent chez Yahoo devient visible au lieu de passer inaperçu.
+calendrier <- xts(order.by = seq(as.Date(DEBUT), as.Date(FIN), by = "day"))
+donnees <- merge(calendrier, brut)
+n_manquants <- sum(is.na(donnees$BTC_Close)) + sum(is.na(donnees$ETH_Close))
+# Comble par la dernière valeur connue : seule méthode qui n'utilise pas d'information future.
+donnees <- na.omit(na.locf(donnees))
+ecart_adj <- max(abs(donnees$BTC_Adj - donnees$BTC_Close)) + max(abs(donnees$ETH_Adj - donnees$ETH_Close))
+cat("Jours manquants :", n_manquants, "| Écart maximal entre Adjusted et Close :", ecart_adj, "\n")
+```
+
+```{r indicateurs}
+
+d <- merge(
+  log_BTC = log(donnees$BTC_Close), log_ETH = log(donnees$ETH_Close),
+  r_BTC = diff(log(donnees$BTC_Close)), r_ETH = diff(log(donnees$ETH_Close)),
+  ma30_BTC = rollapply(donnees$BTC_Close, 30, mean, align = "right"),
+  vol30_BTC = rollapply(diff(log(donnees$BTC_Close)), 30, sd, align = "right") * sqrt(365),
+  BTC_Close = donnees$BTC_Close, ETH_Close = donnees$ETH_Close)
+colnames(d) <- c("log_BTC", "log_ETH", "r_BTC", "r_ETH", "ma30_BTC", "vol30_BTC", "BTC_Close", "ETH_Close")
+# Retire les 30 premières lignes.
+d <- na.omit(d)
+N <- nrow(d)
+
+
+n_train <- floor(N * PART_TRAIN)
+train <- d[1:n_train, ]; test <- d[(n_train + 1):N, ]
+cat(sprintf("Échantillon : %s au %s (%d jours)\nApprentissage : jusqu'au %s (%d jours)\nTest : %s au %s (%d jours)\n",
+            format(start(d)), format(end(d)), N, format(end(train)), n_train, format(start(test)), format(end(test)), N - n_train))
+logp <- as.numeric(d$log_BTC); prix <- as.numeric(d$BTC_Close)
+y_train <- ts(logp[1:n_train])
+```
+
+# 2. Analyse exploratoire
+
+```{r graphiques, fig.height=6}
+# Trace les prix en échelle logarithmique : une variation de 10 % a la même hauteur quel que soit le niveau de prix.
+par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+plot(index(d), prix, type = "l", log = "y", col = "#E8871E", xlab = "", ylab = "USD (log)", main = "Bitcoin — prix de clôture et moyenne mobile 30 jours")
+lines(index(d), as.numeric(d$ma30_BTC), lty = 2); abline(v = start(test), col = "red", lty = 3)
+plot(index(d), as.numeric(d$r_BTC), type = "l", col = "grey30", xlab = "", ylab = "r_BTC", main = "Rendements logarithmiques journaliers du Bitcoin")
+```
+
+```{r descriptif}
+# Calcule les statistiques sur le train uniquement.
+decrire <- function(x) { x <- as.numeric(x); m <- mean(x); s <- sd(x)
+  c(moyenne = m, ecart_type = s, min = min(x), max = max(x),
+    skewness = mean((x - m)^3) / mean((x - m)^2)^1.5, kurtosis_exces = mean((x - m)^4) / mean((x - m)^2)^2 - 3) }
+desc <- rbind(r_BTC = decrire(train$r_BTC), r_ETH = decrire(train$r_ETH))
+cat("Corrélation des rendements BTC/ETH :", round(cor(train$r_BTC, train$r_ETH), 3), "\n")
+tableau(desc, "02_statistiques_descriptives", 5)
+```
+
+## ACF et PACF
+
+```{r acf, fig.height=7}
+# Compare ACF et PACF avant et après différenciation .
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+acf(as.numeric(train$log_BTC), lag.max = 40, main = "ACF — log-prix BTC")
+pacf(as.numeric(train$log_BTC), lag.max = 40, main = "PACF — log-prix BTC")
+acf(as.numeric(train$r_BTC), lag.max = 40, main = "ACF — rendements BTC")
+pacf(as.numeric(train$r_BTC), lag.max = 40, main = "PACF — rendements BTC")
+acf(as.numeric(train$r_BTC)^2, lag.max = 40, main = "ACF — rendements BTC au carré")
+acf(as.numeric(train$r_ETH), lag.max = 40, main = "ACF — rendements ETH")
+# Compte les retards significatifs
+borne <- 1.96 / sqrt(n_train)
+a_r <- acf(as.numeric(train$r_BTC), lag.max = 20, plot = FALSE)$acf[-1]
+a_r2 <- acf(as.numeric(train$r_BTC)^2, lag.max = 20, plot = FALSE)$acf[-1]
+cat(sprintf("Borne à 95 %% : ±%.4f | retards significatifs (sur 20) : %d pour les rendements, %d pour les rendements au carré\n",
+            borne, sum(abs(a_r) > borne), sum(abs(a_r2) > borne)))
+```
+
+**Interprétation.** L'ACF du log-prix décroît très lentement et sa PACF présente un seul pic proche de 1 au retard 1 : c'est le comportement d'une marche aléatoire, la série doit être différenciée. Après différenciation, l'ACF et la PACF des rendements sont presque entièrement dans la bande de confiance : les ordres $p$ et $q$ seront faibles. L'ACF des rendements au carré, elle, reste significative sur de nombreux retards : l'ampleur des variations est prévisible même si leur signe ne l'est pas, ce qui annonce un effet ARCH.
+
+## Décomposition STL
+
+```{r stl, fig.height=6}
+# Décompose avec STL robuste de période 7 
+dec <- stl(ts(logp[1:n_train], frequency = 7), s.window = 7, robust = TRUE)
+plot(dec, main = "Décomposition STL du log-prix du Bitcoin (période 7)")
+comp <- dec$time.series
+
+# Mesure la force de la saisonnalité 
+force_saison <- max(0, 1 - var(comp[, "remainder"]) / var(comp[, "seasonal"] + comp[, "remainder"]))
+force_tendance <- max(0, 1 - var(comp[, "remainder"]) / var(comp[, "trend"] + comp[, "remainder"]))
+# Teste l'effet du jour de la semaine sans supposer la normalité, qui est violée ici.
+kw <- kruskal.test(as.numeric(train$r_BTC), factor(weekdays(index(train))))
+cat(sprintf("Force de la tendance : %.3f | force de la saisonnalité : %.3f\n", force_tendance, force_saison))
+cat("Kruskal-Wallis :", verdict(kw$p.value, "mêmes rendements les 7 jours"), "\n")
+```
+
+**Commentaire.** La tendance porte presque toute la variance et n'est pas linéaire : c'est une tendance stochastique. Si la force de la saisonnalité est inférieure à 0,1 et que le test de Kruskal-Wallis ne rejette pas H0, la composante hebdomadaire n'est que du bruit. Le reste a une variance visiblement non constante.
+
+## Valeurs aberrantes
+
+```{r aberrants}
+# Calcule un score z robuste sur les 90 jours précédents 
+r <- as.numeric(d$r_BTC)
+med <- c(NA, head(rollapply(r, 90, median, fill = NA, align = "right"), -1))
+ecart_abs <- abs(r - med)
+mad_gl <- c(NA, head(rollapply(ecart_abs, 90, median, fill = NA, align = "right"), -1))
+z <- (r - med) / (1.4826 * mad_gl)
+ab <- which(abs(z) > 5)
+plot(index(d), r, type = "l", col = "grey40", xlab = "", ylab = "r_BTC", main = "Valeurs aberrantes des rendements BTC (|z robuste| > 5)")
+points(index(d)[ab], r[ab], col = "red", pch = 19, cex = 0.6)
+cat(sprintf("%d jours aberrants sur %d (%.2f %%)\n", length(ab), N, 100 * length(ab) / N))
+top <- ab[order(-abs(z[ab]))][1:min(10, length(ab))]
+tableau(data.frame(date = index(d)[top], rendement_pct = 100 * r[top], z_robuste = z[top]), "02_valeurs_aberrantes", 2)
+```
+
+**Traitement retenu : conservation.** Ces points sont de vrais mouvements de marché, pas des erreurs de mesure. Les retirer supprimerait le risque que l'on cherche à modéliser. Ils sont pris en charge par la loi de Student du modèle GARCH.
+
+## Stationnarité : ADF et KPSS
+
+L'ADF a pour hypothèse nulle la **non-stationnarité**, le KPSS la **stationnarité**. Une série est déclarée non stationnaire quand l'ADF ne rejette pas et que le KPSS rejette. Les p-values de `tseries` sont bornées (entre 0,01 et 0,10).
+
+```{r stationnarite}
+# Applique les deux tests aux niveaux puis aux différences
+tester <- function(x, nom, niveau) {
+  x <- as.numeric(x)
+  a <- adf.test(x); k <- kpss.test(x, null = if (niveau) "Trend" else "Level")
+  concl <- if (a$p.value >= ALPHA && k$p.value < ALPHA) "non stationnaire" else if (a$p.value < ALPHA && k$p.value >= ALPHA) "stationnaire" else "tests en désaccord"
+  data.frame(serie = nom, ADF_stat = a$statistic, ADF_p = a$p.value, KPSS_stat = k$statistic, KPSS_p = k$p.value, conclusion = concl, row.names = NULL)
+}
+tab_stat <- rbind(tester(train$log_BTC, "log-prix BTC", TRUE), tester(train$r_BTC, "rendement BTC", FALSE),
+                  tester(train$log_ETH, "log-prix ETH", TRUE), tester(train$r_ETH, "rendement ETH", FALSE))
+tableau(tab_stat, "02_tests_stationnarite")
+```
+
+**Conclusion.** Si le log-prix est non stationnaire et le rendement stationnaire, la série est intégrée d'ordre 1 : on retient $d = 1$.
+
+# 3. Modélisation classique
+
+## Protocole d'évaluation
+
+Comme en Python : paramètres estimés sur l'apprentissage puis **figés**, prévision glissante à chaque jour du test, évaluation aux horizons 1, 5 et 10 jours sur les mêmes dates. La référence est la prévision naïve (« le prix ne change pas »).
+
+```{r protocole}
+# Définit les origines et l'évaluation une seule fois 
+origines <- (n_train - H + 1):(N - 1)       
+chemins <- list()
+extraire <- function(ch, h) {
+  cibles <- origines + h
+  ok <- cibles > n_train & cibles <= N & !is.na(ch[, h])
+  list(prev = exp(ch[ok, h]), reel = prix[cibles[ok]])
+}
+metriques <- function(prev, reel) { e <- reel - prev
+  c(MSE = mean(e^2), RMSE = sqrt(mean(e^2)), MAE = mean(abs(e)), MAPE_pct = 100 * mean(abs(e / reel))) }
+
+chemins[["Naïf"]] <- matrix(logp[origines], nrow = length(origines), ncol = H)
+```
+
+## 3.1 ARIMA et SARIMA
+
+```{r arima_manuel}
+# Ajuste les candidats lus sur l'ACF/PACF 
+candidats <- list(c(0, 1, 0), c(1, 1, 0), c(0, 1, 1), c(1, 1, 1))
+manuel <- do.call(rbind, lapply(candidats, function(o) {
+  m <- Arima(y_train, order = o, include.drift = FALSE)
+  data.frame(modele = sprintf("ARIMA(%d,%d,%d)", o[1], o[2], o[3]), k = length(coef(m)), AIC = m$aic, BIC = m$bic)
+}))
+tableau(manuel, "03_arima_manuel", 2)
+```
+
+```{r arima_auto}
+# Lance auto.arima en recherche exhaustive
+auto <- auto.arima(y_train, d = 1, seasonal = FALSE, max.p = 3, max.q = 3, stepwise = FALSE, approximation = FALSE, ic = "aic", allowdrift = TRUE)
+auto_bic <- auto.arima(y_train, d = 1, seasonal = FALSE, max.p = 3, max.q = 3, stepwise = FALSE, approximation = FALSE, ic = "bic", allowdrift = TRUE)
+cat("auto.arima selon l'AIC :", capture.output(print(auto))[2], "\n")
+cat("auto.arima selon le BIC :", capture.output(print(auto_bic))[2], "\n")
+cat(sprintf("Écart d'AIC entre le meilleur candidat manuel et auto.arima : %.2f\n", min(manuel$AIC) - auto$aic))
+arima_fin <- auto
+summary(arima_fin)
+```
+
+**Comparaison des deux approches.** Un écart d'AIC inférieur à 2 signifie que le modèle manuel et le modèle automatique sont statistiquement équivalents. Si l'AIC et le BIC ne désignent pas le même modèle, les termes supplémentaires retenus par l'AIC apportent très peu. On retient le modèle de l'AIC, car l'objectif est la prévision.
+
+```{r sarima}
+# Ajoute une composante saisonnière de période 7 : vérifie par l'AIC que la saisonnalité est bien inutile.
+ordre <- arimaorder(arima_fin)[1:3]
+derive <- "drift" %in% names(coef(arima_fin))
+sarima <- tryCatch(Arima(ts(logp[1:n_train], frequency = 7), order = ordre, seasonal = list(order = c(1, 0, 1), period = 7), include.drift = derive),
+                   error = function(e) NULL)
+if (!is.null(sarima)) {
+  cat(sprintf("AIC de l'ARIMA : %.2f | AIC du SARIMA(1,0,1)[7] : %.2f | gain : %.2f\n", arima_fin$aic, sarima$aic, arima_fin$aic - sarima$aic))
+  cat(if (arima_fin$aic - sarima$aic > 2 && sarima$bic < arima_fin$bic) "La saisonnalité améliore le modèle.\n" else "La saisonnalité n'améliore pas le modèle : on garde l'ARIMA non saisonnier.\n")
+}
+```
+
+### Diagnostic des résidus
+
+| Propriété | Test | H0 |
+|---|---|---|
+| Indépendance | Ljung-Box | pas d'autocorrélation |
+| Normalité | Jarque-Bera | résidus normaux |
+| Variance constante | ARCH-LM | pas d'effet ARCH |
+
+```{r diag_arima, fig.height=6}
+# Regroupe les trois tests dans une fonction 
+diagnostic <- function(e, nom, ddl = 0) {
+  e <- as.numeric(na.omit(e))
+  data.frame(serie = nom,
+             LjungBox10_p = Box.test(e, lag = 10, type = "Ljung-Box", fitdf = ddl)$p.value,
+             LjungBox20_p = Box.test(e, lag = 20, type = "Ljung-Box", fitdf = ddl)$p.value,
+             JarqueBera_p = jarque.bera.test(e)$p.value,
+             kurtosis = mean((e - mean(e))^4) / mean((e - mean(e))^2)^2,
+             ARCH_LM10_p = ArchTest(e, lags = 10)$p.value,
+             LjungBox_carres10_p = Box.test(e^2, lag = 10, type = "Ljung-Box")$p.value, row.names = NULL)
+}
+res_arima <- as.numeric(residuals(arima_fin))[-1]
+diag_arima <- diagnostic(res_arima, "ARIMA", ddl = ordre[1] + ordre[3])
+cat("Indépendance :", verdict(diag_arima$LjungBox10_p, "résidus non autocorrélés"), "\n")
+cat("Normalité :", verdict(diag_arima$JarqueBera_p, "résidus normaux"), "\n")
+cat("Homoscédasticité :", verdict(diag_arima$ARCH_LM10_p, "pas d'effet ARCH"), "\n")
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+plot(res_arima, type = "l", col = "grey30", main = "Résidus", ylab = "")
+acf(res_arima, lag.max = 30, main = "ACF des résidus")
+qqnorm(res_arima, pch = 20, cex = 0.4); qqline(res_arima, col = "red")
+acf(res_arima^2, lag.max = 30, main = "ACF des résidus au carré")
+tableau(t(diag_arima[, -1]), "03_diagnostic_arima")
+```
+
+**Lecture.** Si le Ljung-Box ne rejette pas H0, la moyenne est bien modélisée. La normalité est presque toujours rejetée sur des rendements financiers (kurtosis très supérieur à 3) : aucun ordre ARIMA ne peut le corriger. Un test ARCH-LM qui rejette H0 indique que la variance dépend du passé et justifie le GARCH de la section 3.3.
+
+```{r arima_prevision}
+
+ch <- matrix(NA, length(origines), H)
+for (i in seq_along(origines)) {
+  ajuste <- Arima(ts(logp[1:origines[i]]), model = arima_fin)
+  ch[i, ] <- as.numeric(forecast(ajuste, h = H)$mean)
+}
+chemins[["ARIMA"]] <- ch
+
+
+p10 <- forecast(arima_fin, h = H, level = 95)
+ic <- data.frame(date = index(d)[(n_train + 1):(n_train + H)], prevision = exp(as.numeric(p10$mean)),
+                 borne_basse_95 = exp(as.numeric(p10$lower)), borne_haute_95 = exp(as.numeric(p10$upper)), reel = prix[(n_train + 1):(n_train + H)])
+plot(p10, include = 60, main = "ARIMA : prévision à 10 jours du log-prix avec intervalle à 95 %")
+lines((n_train + 1):(n_train + H), logp[(n_train + 1):(n_train + H)], col = "red")
+tableau(ic, "03_arima_prevision_10j", 0)
+```
+
+## 3.2 VAR, causalité de Granger et cointégration
+
+Le VAR est estimé sur les **rendements** des deux actifs, car il suppose des séries stationnaires.
+
+```{r var}
+# Choisit l'ordre du VAR par critère d'information
+rdt_train <- as.data.frame(coredata(train[, c("r_BTC", "r_ETH")]))
+sel <- VARselect(rdt_train, lag.max = 14, type = "const")
+print(sel$selection)
+P_VAR <- max(1, sel$selection[["AIC(n)"]])
+var_fin <- VAR(rdt_train, p = P_VAR, type = "const")
+cat(sprintf("Ordre retenu : p = %d | module maximal des racines : %.3f (inférieur à 1 : VAR stable)\n", P_VAR, max(roots(var_fin))))
+knitr::kable(coef(var_fin)$r_BTC, digits = 4, caption = "Équation du rendement BTC")
+```
+
+```{r diag_var}
+# Diagnostique les résidus du VAR 
+pt <- serial.test(var_fin, lags.pt = max(10, P_VAR + 5), type = "PT.adjusted")
+cat("Portemanteau multivarié :", verdict(pt$serial$p.value, "résidus du système non autocorrélés"), "\n")
+res_var <- residuals(var_fin)
+diag_var <- rbind(diagnostic(res_var[, "r_BTC"], "VAR — équation r_BTC"), diagnostic(res_var[, "r_ETH"], "VAR — équation r_ETH"))
+cat("Corrélation des résidus des deux équations :", round(cor(res_var)[1, 2], 3), "\n")
+tableau(diag_var, "03_diagnostic_var")
+```
+
+### Causalité de Granger
+
+$X$ cause $Y$ au sens de Granger si le passé de $X$ améliore la prévision de $Y$ une fois le passé de $Y$ pris en compte. C'est une notion **prédictive**, pas une causalité physique, et elle ne concerne que les jours passés : le lien du jour même est mesuré par la causalité instantanée.
+
+```{r granger}
+# Teste la causalité dans les deux sens : savoir si ETH aide à prévoir BTC 
+g_eth <- causality(var_fin, cause = "r_ETH"); g_btc <- causality(var_fin, cause = "r_BTC")
+tab_g <- data.frame(H0 = c("ETH ne cause pas BTC (Granger)", "BTC ne cause pas ETH (Granger)", "Pas de causalité instantanée"),
+                    statistique = c(as.numeric(g_eth$Granger$statistic), as.numeric(g_btc$Granger$statistic), as.numeric(g_eth$Instant$statistic)),
+                    p_value = c(as.numeric(g_eth$Granger$p.value), as.numeric(g_btc$Granger$p.value), as.numeric(g_eth$Instant$p.value)))
+tab_g$decision <- ifelse(tab_g$p_value < ALPHA, "H0 rejetée", "H0 non rejetée")
+tableau(tab_g, "03_granger")
+```
+
+```{r var_irf, fig.height=6}
+# Trace les réponses impulsionnelles : montre combien de jours un choc sur un actif se propage à l'autre.
+plot(irf(var_fin, n.ahead = 10, boot = TRUE, runs = 100))
+```
+
+```{r var_prevision}
+# Écrit la récurrence du VAR à la main pour prévoir depuis n'importe quelle origine avec des coefficients figés.
+B <- Bcoef(var_fin)                                   # colonnes : r_BTC.l1, r_ETH.l1, r_BTC.l2, ..., const
+prevoir_var <- function(hist, h) {
+  y <- hist[(nrow(hist) - P_VAR + 1):nrow(hist), , drop = FALSE]
+  sortie <- matrix(NA, h, ncol(hist))
+  for (s in 1:h) {
+    z <- c(as.vector(t(y[P_VAR:1, , drop = FALSE])), 1)   # retards du plus récent au plus ancien, puis la constante
+    sortie[s, ] <- as.vector(B %*% z)
+    y <- rbind(y[-1, , drop = FALSE], sortie[s, ])
+  }
+  sortie
+}
+# Contrôle la formule manuelle contre predict() 
+controle <- max(abs(prevoir_var(as.matrix(rdt_train), H)[, 1] - predict(var_fin, n.ahead = H)$fcst$r_BTC[, "fcst"]))
+cat(sprintf("Écart maximal entre la formule manuelle et predict() : %.2e\n", controle))
+stopifnot(controle < 1e-8)
+
+rdt <- as.matrix(coredata(d[, c("r_BTC", "r_ETH")]))
+ch <- matrix(NA, length(origines), H)
+for (i in seq_along(origines)) {
+  t <- origines[i]
+  ch[i, ] <- logp[t] + cumsum(prevoir_var(rdt[1:t, , drop = FALSE], H)[, 1])   # rendements cumulés → log-prix
+}
+chemins[["VAR"]] <- ch
+```
+
+### Cointégration
+
+Deux séries I(1) sont cointégrées si une combinaison linéaire des deux est stationnaire : elles partagent alors un équilibre de long terme. Si c'est le cas, le bon modèle est un VECM ; sinon, c'est le VAR en différences estimé ci-dessus.
+
+- **Phillips-Ouliaris** (test sur les résidus, de la même famille qu'Engle-Granger). H0 : pas de cointégration.
+- **Johansen** (trace). On teste H0 : $r = 0$, puis H0 : $r \le 1$. On rejette quand la statistique dépasse la valeur critique à 5 %.
+
+```{r cointegration}
+# Teste la cointégration sur les log-prix 
+niveaux <- as.data.frame(coredata(train[, c("log_BTC", "log_ETH")]))
+po <- po.test(as.matrix(niveaux))
+cat("Phillips-Ouliaris :", verdict(po$p.value, "pas de cointégration"), "(p-value bornée entre 0,01 et 0,15)\n")
+
+# Le nombre de retards du test de Johansen est celui du VAR en niveaux 
+K_NIV <- max(2, VARselect(niveaux, lag.max = 10, type = "const")$selection[["AIC(n)"]])
+jo <- ca.jo(niveaux, type = "trace", ecdet = "none", K = K_NIV, spec = "transitory")
+
+tab_jo <- data.frame(H0 = c("r <= 1", "r = 0"), statistique = as.numeric(jo@teststat),
+                     critique_10pct = jo@cval[, 1], critique_5pct = jo@cval[, 2], critique_1pct = jo@cval[, 3], row.names = NULL)
+tab_jo$decision <- ifelse(tab_jo$statistique > tab_jo$critique_5pct, "H0 rejetée", "H0 non rejetée")
+rejet_r0 <- tab_jo$statistique[2] > tab_jo$critique_5pct[2]
+rejet_r1 <- tab_jo$statistique[1] > tab_jo$critique_5pct[1]
+RANG <- if (!rejet_r0) 0 else if (!rejet_r1) 1 else 2
+COINTEGRE <- RANG == 1
+cat(sprintf("Johansen (K = %d) : rang de cointégration estimé r = %d\n", K_NIV, RANG))
+cat(if (COINTEGRE) "Cointégration détectée : on estime un VECM.\n" else "Pas de cointégration au seuil de 5 % : le VAR en différences est le bon modèle, un VECM n'est pas justifié.\n")
+tableau(tab_jo, "03_johansen", 3)
+```
+
+```{r vecm}
+
+if (COINTEGRE) {
+  vecm <- cajorls(jo, r = 1)
+  cat("Vecteur de cointégration (beta) :\n"); print(round(vecm$beta, 4))
+  cat("\nCoefficients d'ajustement (ligne ect1 = alpha) et dynamique de court terme :\n"); print(summary(vecm$rlm))
+  alpha <- coef(vecm$rlm)["ect1", ]; rappel <- sum(alpha * vecm$beta[1:2, 1])
+  if (rappel > -1 && rappel < 0) cat(sprintf("\nDemi-vie d'un écart à l'équilibre : %.0f jours\n", log(0.5) / log(1 + rappel)))
+} else {
+  cat("VECM non estimé : aucune relation de cointégration détectée. Le Bitcoin et l'Ethereum sont fortement corrélés à court terme\nmais ne partagent pas d'équilibre de long terme stable sur cette période.\n")
+}
+```
+
+**Interprétation du VECM (si estimé).** Le coefficient `ect1` de chaque équation est la vitesse d'ajustement $\alpha$ : la part de l'écart à l'équilibre de la veille corrigée en un jour. Une série dont l'$\alpha$ n'est pas significatif ne s'ajuste pas : c'est elle qui mène, l'autre suit.
+
+## 3.3 Volatilité conditionnelle : GARCH
+
+Le GARCH(1,1) modélise la variance du jour en fonction du choc de la veille ($\alpha$, la réaction) et de la variance de la veille ($\beta$, la mémoire) : $\sigma_t^2 = \omega + \alpha\,\varepsilon_{t-1}^2 + \beta\,\sigma_{t-1}^2$. Il prévoit l'ampleur des variations, pas leur sens.
+
+```{r arch_test}
+# Vérifie l'effet ARCH sur les résidus de l'ARIMA à plusieurs retards 
+tab_arch <- do.call(rbind, lapply(c(1, 5, 10, 20), function(k) { a <- ArchTest(res_arima, lags = k)
+  data.frame(retards = k, statistique_LM = as.numeric(a$statistic), p_value = a$p.value) }))
+cat("ARCH-LM (10 retards) :", verdict(tab_arch$p_value[3], "pas d'effet ARCH"), "\n")
+tableau(tab_arch, "03_arch_lm")
+```
+
+```{r garch}
+# Compare plusieurs spécifications : le GARCH(1,1) est la référence, les autres ne sont retenues que si le BIC le justifie.
+r_pct <- 100 * as.numeric(train$r_BTC)           
+specs <- list(
+  "GARCH(1,1) normale"     = ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0)), distribution.model = "norm"),
+  "GARCH(1,1) Student"     = ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0)), distribution.model = "std"),
+  "GARCH(2,1) Student"     = ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(2, 1)), mean.model = list(armaOrder = c(0, 0)), distribution.model = "std"),
+  "GJR-GARCH(1,1) Student" = ugarchspec(variance.model = list(model = "gjrGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0)), distribution.model = "std"),
+  "EGARCH(1,1) Student"    = ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0)), distribution.model = "std"))
+garchs <- lapply(specs, function(s) tryCatch(ugarchfit(s, data = r_pct, solver = "hybrid"), error = function(e) NULL))
+# Écarte les ajustements qui n'ont pas convergé 
+garchs <- garchs[!sapply(garchs, function(g) is.null(g) || convergence(g) != 0)]
+tab_garch <- do.call(rbind, lapply(names(garchs), function(nom) { g <- garchs[[nom]]; zs <- as.numeric(residuals(g, standardize = TRUE))
+  data.frame(modele = nom, k = length(coef(g)), logL = likelihood(g), AIC = infocriteria(g)[1] * length(r_pct), BIC = infocriteria(g)[2] * length(r_pct),
+             persistance = persistence(g), LB_z2_10_p = Box.test(zs^2, lag = 10, type = "Ljung-Box")$p.value, ARCH_LM_z_10_p = ArchTest(zs, lags = 10)$p.value) }))
+NOM_GARCH <- tab_garch$modele[which.min(tab_garch$BIC)]
+garch_fin <- garchs[[NOM_GARCH]]
+cat("Modèle retenu (BIC minimal) :", NOM_GARCH, "\n")
+tableau(tab_garch, "03_garch_comparaison")
+```
+
+```{r diag_garch, fig.height=7}
+# Diagnostique les résidus standardisés 
+print(round(garch_fin@fit$matcoef, 4))
+cat(sprintf("\nPersistance : %.4f | demi-vie d'un choc de volatilité : %.0f jours\n", persistence(garch_fin), halflife(garch_fin)))
+z_fin <- as.numeric(residuals(garch_fin, standardize = TRUE))
+diag_garch <- diagnostic(z_fin, paste("Résidus standardisés —", NOM_GARCH))
+cat(sprintf("ARCH-LM(10) : p = %.4f avant GARCH → p = %.4f après GARCH\n", diag_arima$ARCH_LM10_p, diag_garch$ARCH_LM10_p))
+cat(if (diag_garch$ARCH_LM10_p >= ALPHA) "L'hétéroscédasticité est correctement modélisée.\n" else "Il reste de l'effet ARCH : un ordre supérieur est à envisager.\n")
+
+
+par(mfrow = c(2, 1), mar = c(3, 4, 3, 1))
+vol_cond <- as.numeric(sigma(garch_fin)) * sqrt(365)
+plot(index(train), vol_cond, type = "l", col = "#E8871E", xlab = "", ylab = "% annualisé", main = paste("Volatilité conditionnelle du Bitcoin —", NOM_GARCH))
+lines(index(train), 100 * as.numeric(train$vol30_BTC), col = "grey50")
+evenements <- as.Date(c("2020-03-12", "2021-05-19", "2022-05-09", "2022-11-08", "2024-01-10", "2024-08-05", "2025-10-10"))
+abline(v = evenements[evenements <= end(train)], col = "red", lty = 3)
+legend("top", c("GARCH", "Réalisée 30 jours", "Événements"), col = c("#E8871E", "grey50", "red"), lty = c(1, 1, 3), bty = "n", horiz = TRUE)
+acf(z_fin^2, lag.max = 30, main = "ACF des résidus standardisés au carré")
+tableau(t(diag_garch[, -1]), "03_diagnostic_garch")
+```
+
+**Lecture.** Le point décisif est la comparaison avant/après du test ARCH-LM : rejeté sur les résidus de l'ARIMA, il ne doit plus l'être sur les résidus standardisés du GARCH. Une persistance proche de 1 signifie qu'un choc de volatilité met longtemps à s'effacer. Les lignes rouges correspondent au krach COVID (mars 2020), à la chute de mai 2021, à l'effondrement de Terra/Luna (mai 2022), à la faillite de FTX (novembre 2022), à l'approbation des ETF Bitcoin (janvier 2024), au débouclage du carry trade sur le yen (août 2024) et aux liquidations d'octobre 2025.
+
+# 6. Prévision et évaluation
+
+```{r evaluation}
+
+tab_m <- do.call(rbind, lapply(HORIZONS, function(h) do.call(rbind, lapply(names(chemins), function(nom) {
+  x <- extraire(chemins[[nom]], h); data.frame(horizon = h, modele = nom, n = length(x$prev), t(metriques(x$prev, x$reel))) }))))
+tab_m$RMSE_relatif_naif <- tab_m$RMSE / tab_m$RMSE[match(paste(tab_m$horizon, "Naïf"), paste(tab_m$horizon, tab_m$modele))]
+tableau(tab_m, "06_metriques", 4)
+```
+
+```{r diebold_mariano}
+
+tab_dm <- do.call(rbind, lapply(HORIZONS, function(h) do.call(rbind, lapply(setdiff(names(chemins), "Naïf"), function(nom) {
+  a <- extraire(chemins[[nom]], h); b <- extraire(chemins[["Naïf"]], h)
+  t_ <- tryCatch(dm.test(a$reel - a$prev, b$reel - b$prev, h = h, power = 2), error = function(e) NULL)
+  data.frame(horizon = h, modele = nom, statistique_DM = if (is.null(t_)) NA else as.numeric(t_$statistic), p_value = if (is.null(t_)) NA else t_$p.value) }))))
+tab_dm$conclusion <- ifelse(is.na(tab_dm$p_value), "non défini",
+                     ifelse(tab_dm$p_value < ALPHA & tab_dm$statistique_DM < 0, "meilleur que le naïf",
+                     ifelse(tab_dm$p_value < ALPHA, "moins bon que le naïf", "pas de différence significative")))
+tableau(tab_dm, "06_diebold_mariano")
+```
+
+```{r graphique_final}
+# Trace les prévisions à 1 jour sur les 90 derniers jours
+dates_test <- index(d)[(n_train + 1):N]; k <- (length(dates_test) - 89):length(dates_test)
+plot(dates_test[k], prix[(n_train + 1):N][k], type = "l", lwd = 2, xlab = "", ylab = "USD", main = "Prévisions à 1 jour — 90 derniers jours du test")
+lines(dates_test[k], extraire(chemins[["ARIMA"]], 1)$prev[k], col = "#E8871E")
+lines(dates_test[k], extraire(chemins[["VAR"]], 1)$prev[k], col = "#3B6FB6", lty = 2)
+legend("topleft", c("Réel", "ARIMA", "VAR"), col = c("black", "#E8871E", "#3B6FB6"), lty = c(1, 1, 2), lwd = c(2, 1, 1), bty = "n")
+```
+
+**Conclusion.** Un RMSE relatif au naïf proche de 1 et un test de Diebold-Mariano non significatif signifient que le modèle ne fait pas mieux que « le prix de demain est celui d'aujourd'hui ». C'est le résultat attendu pour un actif dont le prix suit une marche aléatoire, et il doit être rapporté tel quel. La comparaison complète, réseaux de neurones compris, figure dans le notebook Python et dans le rapport. Les résultats R et Python peuvent différer à la marge (algorithmes d'estimation et sélection d'ordre légèrement différents), mais les conclusions doivent être les mêmes.
+
+
+
